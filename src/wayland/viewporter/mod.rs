@@ -151,30 +151,24 @@ where
                         surface: surface.downgrade(),
                     },
                 );
-                let initial = with_states(&surface, |states| {
-                    let inserted = states
+                let hook_is_new = with_states(&surface, |states| {
+                    // The state may exist as `None` already: ensure_viewport_valid (through
+                    // on_commit_buffer_handler) inserts it on the first commit. Whether the
+                    // pre-commit hook is installed is therefore its own fact.
+                    let mut marker = states
                         .data_map
-                        .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| {
-                            Mutex::new(Some(ViewportMarker(viewport.downgrade())))
-                        });
-
-                    // if we did not insert the marker it will be None as
-                    // checked in already_has_viewport and we have to update
-                    // it now
-                    if !inserted {
-                        *states
-                            .data_map
-                            .get::<ViewporterSurfaceState>()
-                            .unwrap()
-                            .lock()
-                            .unwrap() = Some(ViewportMarker(viewport.downgrade()));
-                    }
-
-                    inserted
+                        .get_or_insert_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None))
+                        .lock()
+                        .unwrap();
+                    *marker = Some(ViewportMarker(viewport.downgrade()));
+                    drop(marker);
+                    states
+                        .data_map
+                        .insert_if_missing_threadsafe(|| ViewportHookInstalled)
                 });
 
                 // only add the pre-commit hook once for the surface
-                if initial {
+                if hook_is_new {
                     compositor::add_pre_commit_hook::<D, _>(&surface, viewport_pre_commit_hook);
                 }
             }
@@ -307,6 +301,9 @@ pub struct ViewportState {
 }
 
 pub(crate) struct ViewportMarker(Weak<wp_viewport::WpViewport>);
+
+/// Set on a surface once the `bad_size` pre-commit hook has been added to it.
+struct ViewportHookInstalled;
 
 fn viewport_pre_commit_hook<D: 'static>(
     _state: &mut D,
