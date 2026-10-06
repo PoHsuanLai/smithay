@@ -75,6 +75,13 @@ impl TextInputHandle {
             serial: 0,
             pending_state: Default::default(),
         });
+        // `enter` is "sent to each text input object of the client" whose surface has the
+        // focus, so one created later gets it too (only this new object: the others have it).
+        if let Some(surface) = inner.focus.as_ref().filter(|surface| surface.is_alive()) {
+            if instance.id().same_client_as(&surface.id()) {
+                instance.enter(surface);
+            }
+        }
     }
 
     fn increment_serial(&self, text_input: &ZwpTextInputV3) {
@@ -127,23 +134,12 @@ impl TextInputHandle {
 
     /// Have the compositor act as the input method for this seat.
     ///
-    /// While enabled, `enter` is delivered to the focused text-input even when no real
-    /// `zwp_input_method_v2` is bound, so the compositor can `commit_string` into it (e.g. for
-    /// remote-desktop text injection). Toggling this sends `enter`/`leave` for the current
-    /// focus immediately; subsequent focus changes are handled by the keyboard focus logic.
+    /// While enabled, the focused text input's `enable` and `commit` are processed even when no
+    /// real `zwp_input_method_v2` is bound, so the compositor can `commit_string` into it (e.g.
+    /// for remote-desktop text injection). `enter` and `leave` follow keyboard focus either way,
+    /// so toggling this sends none.
     pub fn set_compositor_input_method(&self, active: bool) {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.compositor_input_method == active {
-                return;
-            }
-            inner.compositor_input_method = active;
-        }
-        if active {
-            self.enter();
-        } else {
-            self.leave();
-        }
+        self.inner.lock().unwrap().compositor_input_method = active;
     }
 
     /// Whether the compositor is currently acting as the input method for this seat
@@ -233,10 +229,7 @@ where
             self.handle.increment_serial(resource);
         }
 
-        // Discard requests without any active input method instance, unless the compositor
-        // itself is acting as the input method for this seat (the text-injection escape hatch).
-        // In that case we still process enable/commit so the focused client becomes the active
-        // text input and the compositor can `commit_string` into it.
+        // The compositor's own text injection also works without a bound input method.
         if !self.input_method_handle.has_instance() && !self.handle.compositor_input_method() {
             debug!("discarding text-input request without IME running");
             return;
