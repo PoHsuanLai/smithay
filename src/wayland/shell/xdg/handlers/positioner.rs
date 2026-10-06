@@ -45,7 +45,9 @@ where
                 }
             }
             xdg_positioner::Request::SetAnchorRect { x, y, width, height } => {
-                if width < 1 || height < 1 {
+                // xdg_positioner.set_anchor_rect: "If a negative size is set the invalid_input
+                // error is raised". Zero is allowed: a point anchor, as menus on a caret use.
+                if width < 0 || height < 0 {
                     positioner.post_error(
                         xdg_positioner::Error::InvalidInput,
                         "Invalid size for positioner's anchor rectangle.",
