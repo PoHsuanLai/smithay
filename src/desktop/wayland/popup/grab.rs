@@ -1,6 +1,9 @@
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use wayland_server::{Resource, protocol::wl_surface::WlSurface};
@@ -59,6 +62,8 @@ pub enum PopupUngrabStrategy {
 #[derive(Debug, Default)]
 struct PopupGrabInternal {
     serial: Option<Serial>,
+    /// The id of the [`PopupGrab`] whose keyboard grab is installed on the seat, if one is.
+    keyboard_owner: Option<u64>,
     active_grabs: Vec<PopupKind>,
     dismissed_grabs: Vec<PopupKind>,
 }
@@ -117,6 +122,27 @@ impl PopupGrabInner {
     pub(super) fn has_active_grabs(&self) -> bool {
         let guard = self.internal.lock().unwrap();
         guard.has_active_grabs()
+    }
+
+    fn set_keyboard_owner(&self, id: u64) {
+        self.internal.lock().unwrap().keyboard_owner = Some(id);
+    }
+
+    /// The keyboard grab of grab `id` is gone (unset or replaced).
+    fn release_keyboard_owner(&self, id: u64) {
+        let mut guard = self.internal.lock().unwrap();
+        if guard.keyboard_owner == Some(id) {
+            guard.keyboard_owner = None;
+        }
+    }
+
+    /// Whether the seat's popup keyboard grab belongs to a grab other than `id`.
+    fn keyboard_owned_by_other(&self, id: u64) -> bool {
+        self.internal
+            .lock()
+            .unwrap()
+            .keyboard_owner
+            .is_some_and(|owner| owner != id)
     }
 
     fn current_grab(&self) -> Option<PopupKind> {
@@ -228,6 +254,9 @@ where
     <D as SeatHandler>::KeyboardFocus: WaylandFocus,
     <D as SeatHandler>::PointerFocus: From<<D as SeatHandler>::KeyboardFocus> + WaylandFocus,
 {
+    /// Tells this grab from another that has the same serial (a nested popup grabbing with its
+    /// parent's serial); shared by the clones that become its keyboard and pointer grabs.
+    id: u64,
     root: <D as SeatHandler>::KeyboardFocus,
     serial: Serial,
     previous_serial: Option<Serial>,
@@ -263,6 +292,7 @@ where
 {
     fn clone(&self) -> Self {
         PopupGrab {
+            id: self.id,
             root: self.root.clone(),
             serial: self.serial,
             previous_serial: self.previous_serial,
@@ -287,7 +317,9 @@ where
         previous_serial: Option<Serial>,
         keyboard_handle: Option<KeyboardHandle<D>>,
     ) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         PopupGrab {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             root: root.clone(),
             serial,
             previous_serial,
@@ -379,7 +411,10 @@ where
 
     fn unset_keyboard_grab(&self, data: &mut D, serial: Serial) {
         if let Some(keyboard) = self.keyboard_handle.as_ref() {
+            // A nested popup may take its keyboard grab with the serial of this one; that grab
+            // is the nested popup's, and replacing this pointer grab must leave it alone.
             if keyboard.is_grabbed()
+                && !self.toplevel_grab.keyboard_owned_by_other(self.id)
                 && (keyboard.has_grab(self.serial)
                     || keyboard.has_grab(self.previous_serial.unwrap_or(self.serial)))
             {
@@ -426,6 +461,7 @@ where
 {
     /// Create a [`PopupKeyboardGrab`] for the provided [`PopupGrab`]
     pub fn new(popup_grab: &PopupGrab<D>) -> Self {
+        popup_grab.toplevel_grab.set_keyboard_owner(popup_grab.id);
         PopupKeyboardGrab {
             popup_grab: popup_grab.clone(),
         }
@@ -488,7 +524,11 @@ where
         self.popup_grab.keyboard_grab_start_data()
     }
 
-    fn unset(&mut self, _data: &mut D) {}
+    fn unset(&mut self, _data: &mut D) {
+        self.popup_grab
+            .toplevel_grab
+            .release_keyboard_owner(self.popup_grab.id);
+    }
 }
 
 /// Default implementation of a [`PointerGrab`] for [`PopupGrab`]
