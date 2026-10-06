@@ -323,7 +323,12 @@ where
     }
 
     fn destroyed(&self, _state: &mut D, _client: ClientId, _input_method: &ZwpInputMethodV2) {
-        self.handle.inner.lock().unwrap().instance = None;
-        self.text_input_handle.leave();
+        // The text input keeps its focus and stays enabled: text-input-unstable-v3 has no event
+        // for "no input method", and `leave` would end the field's enabled state. A later input
+        // method is activated for it (`TextInputHandle::activate_late_input_method`).
+        let mut inner = self.handle.inner.lock().unwrap();
+        inner.instance = None;
+        // The popup surface belonged to the departed method.
+        inner.popup_handle.surface = None;
     }
 }

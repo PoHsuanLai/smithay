@@ -17,6 +17,9 @@ pub(crate) struct TextInput {
     instances: Vec<Instance>,
     focus: Option<WlSurface>,
     active_text_input_id: Option<ObjectId>,
+    /// What the active text input has committed so far (reset by `enable`), kept so an input
+    /// method that binds after the field was enabled can be told it.
+    applied: TextInputState,
     compositor_input_method: bool,
 }
 
@@ -115,6 +118,7 @@ impl TextInputHandle {
         let mut inner = self.inner.lock().unwrap();
         // Leaving clears the active text input.
         inner.active_text_input_id = None;
+        inner.applied = TextInputState::default();
         // NOTE: we implement it in a symmetrical way with `enter`.
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
@@ -146,6 +150,29 @@ impl TextInputHandle {
     /// (see [`set_compositor_input_method`](Self::set_compositor_input_method)).
     pub fn compositor_input_method(&self) -> bool {
         self.inner.lock().unwrap().compositor_input_method
+    }
+
+    /// Activate `input_method`, which has just bound, for the text input that is enabled
+    /// already: `activate`, then the state it committed (surrounding text, change cause, content
+    /// type, cursor rectangle), then `done`. Does nothing when no text input is enabled.
+    pub(crate) fn activate_late_input_method<D: SeatHandler + 'static>(
+        &self,
+        input_method: &InputMethodHandle,
+        state: &mut D,
+    ) {
+        let mut focus = None;
+        let mut applied = TextInputState::default();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.with_active_text_input(|_, surface, _| focus = Some(surface.clone()));
+            if focus.is_some() {
+                applied = inner.applied.clone();
+            }
+        }
+        if let Some(focus) = focus {
+            input_method.activate_input_method(state, &focus);
+            relay_state(input_method, state, applied);
+        }
     }
 
     /// The `discard_state` is used when the input-method signaled that
@@ -229,12 +256,8 @@ where
             self.handle.increment_serial(resource);
         }
 
-        // The compositor's own text injection also works without a bound input method.
-        if !self.input_method_handle.has_instance() && !self.handle.compositor_input_method() {
-            debug!("discarding text-input request without IME running");
-            return;
-        }
-
+        // Requests are taken without an input method too: a field is enabled before an IME that
+        // starts later is bound, and that IME is activated for it from the state kept here.
         let focus = match self.handle.focus() {
             Some(focus) if focus.id().same_client_as(&resource.id()) => focus,
             _ => {
@@ -283,9 +306,10 @@ where
                 pending_state.cursor_rectangle = Some(Rectangle::new((x, y).into(), (width, height).into()));
             }
             zwp_text_input_v3::Request::Commit => {
-                let mut new_state = mem::take(pending_state);
+                let new_state = mem::take(pending_state);
                 let _ = pending_state;
-                let active_text_input_id = &mut guard.active_text_input_id;
+                let inner = &mut *guard;
+                let active_text_input_id = &mut inner.active_text_input_id;
 
                 if active_text_input_id.is_some() && *active_text_input_id != Some(resource.id()) {
                     debug!("discarding text_input request since we already have an active one");
@@ -295,12 +319,16 @@ where
                 match new_state.enable {
                     Some(true) => {
                         *active_text_input_id = Some(resource.id());
+                        // Enabling starts the state afresh: the client sends all of it again.
+                        inner.applied = TextInputState::default();
+                        inner.applied.merge(&new_state);
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.activate_input_method(state, &focus);
                     }
                     Some(false) => {
                         *active_text_input_id = None;
+                        inner.applied = TextInputState::default();
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         self.input_method_handle.deactivate_input_method(state);
@@ -311,38 +339,14 @@ where
                             debug!("discarding text_input requests before enabling it");
                             return;
                         }
+                        inner.applied.merge(&new_state);
 
                         // Drop the guard before calling to other subsystems later on.
                         drop(guard);
                     }
                 }
 
-                if let Some((text, cursor, anchor)) = new_state.surrounding_text.take() {
-                    self.input_method_handle.with_instance(move |input_method| {
-                        input_method.object.surrounding_text(text, cursor, anchor)
-                    });
-                }
-
-                if let Some(cause) = new_state.text_change_cause.take() {
-                    self.input_method_handle.with_instance(move |input_method| {
-                        input_method.object.text_change_cause(cause);
-                    });
-                }
-
-                if let Some((hint, purpose)) = new_state.content_type.take() {
-                    self.input_method_handle.with_instance(move |input_method| {
-                        input_method.object.content_type(hint, purpose);
-                    });
-                }
-
-                if let Some(rect) = new_state.cursor_rectangle.take() {
-                    self.input_method_handle
-                        .set_text_input_rectangle::<D>(state, rect);
-                }
-
-                self.input_method_handle.with_instance(|input_method| {
-                    input_method.done();
-                });
+                relay_state(&self.input_method_handle, state, new_state);
             }
             zwp_text_input_v3::Request::Destroy => {
                 // Nothing to do
@@ -353,22 +357,18 @@ where
 
     fn destroyed(&self, state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3) {
         let destroyed_id = text_input.id();
+        // The input method serves the active text input only: it is deactivated when that one is
+        // destroyed (an unenabled one going away changes nothing for it).
         let deactivate_im = {
             let mut inner = self.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
-            let destroyed_focused = inner
-                .focus
-                .as_ref()
-                .map(|focus| focus.id().same_client_as(&destroyed_id))
-                .unwrap_or(true);
-
-            // Deactivate IM when we either lost focus entirely or destroyed text-input for the
-            // currently focused client.
-            destroyed_focused
-                && !inner
-                    .instances
-                    .iter()
-                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
+            let was_active = inner.active_text_input_id.as_ref() == Some(&destroyed_id);
+            if was_active {
+                // A destroyed text input is disabled; it must not keep the seat's one active slot.
+                inner.active_text_input_id = None;
+                inner.applied = TextInputState::default();
+            }
+            was_active
         };
 
         if deactivate_im {
@@ -384,11 +384,55 @@ struct Instance {
     pending_state: TextInputState,
 }
 
-#[derive(Debug, Default)]
+/// Sends the input method the parts of a text input's state that are set, closed by `done`.
+fn relay_state<D: SeatHandler + 'static>(
+    input_method: &InputMethodHandle,
+    state: &mut D,
+    mut new_state: TextInputState,
+) {
+    if let Some((text, cursor, anchor)) = new_state.surrounding_text.take() {
+        input_method.with_instance(move |input_method| {
+            input_method.object.surrounding_text(text, cursor, anchor)
+        });
+    }
+
+    if let Some(cause) = new_state.text_change_cause.take() {
+        input_method.with_instance(move |input_method| {
+            input_method.object.text_change_cause(cause);
+        });
+    }
+
+    if let Some((hint, purpose)) = new_state.content_type.take() {
+        input_method.with_instance(move |input_method| {
+            input_method.object.content_type(hint, purpose);
+        });
+    }
+
+    if let Some(rect) = new_state.cursor_rectangle.take() {
+        input_method.set_text_input_rectangle::<D>(state, rect);
+    }
+
+    input_method.with_instance(|input_method| {
+        input_method.done();
+    });
+}
+
+#[derive(Debug, Default, Clone)]
 struct TextInputState {
     enable: Option<bool>,
     surrounding_text: Option<(String, u32, u32)>,
     content_type: Option<(ContentHint, ContentPurpose)>,
     cursor_rectangle: Option<Rectangle<i32, Logical>>,
     text_change_cause: Option<ChangeCause>,
+}
+
+impl TextInputState {
+    /// Overwrites each part of `self` that `newer` sets.
+    fn merge(&mut self, newer: &TextInputState) {
+        self.enable = newer.enable.or(self.enable);
+        self.surrounding_text = newer.surrounding_text.clone().or(self.surrounding_text.take());
+        self.content_type = newer.content_type.or(self.content_type);
+        self.cursor_rectangle = newer.cursor_rectangle.or(self.cursor_rectangle);
+        self.text_change_cause = newer.text_change_cause.or(self.text_change_cause);
+    }
 }
