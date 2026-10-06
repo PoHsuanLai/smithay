@@ -55,16 +55,19 @@ pub struct InputMethodHandle {
 }
 
 impl InputMethodHandle {
-    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
+    /// Makes `instance` the seat's input method. Returns whether it became one: when another
+    /// is bound already, the newcomer is told `unavailable` and the bound one is left alone.
+    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
-            instance.serial = 0;
-            instance.object.unavailable();
+        if inner.instance.is_some() {
+            instance.unavailable();
+            false
         } else {
             inner.instance = Some(Instance {
                 object: instance.clone(),
                 serial: 0,
             });
+            true
         }
     }
 

@@ -218,7 +218,7 @@ where
                         dismiss_popup: D::dismiss_popup,
                     },
                 );
-                handle.add_instance(&instance);
+                let _ = handle.add_instance(&instance);
             }
             zwp_input_method_manager_v2::Request::Destroy => {
                 // Nothing to do
