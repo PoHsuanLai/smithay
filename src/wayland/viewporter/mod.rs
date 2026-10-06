@@ -305,40 +305,49 @@ pub(crate) struct ViewportMarker(Weak<wp_viewport::WpViewport>);
 /// Set on a surface once the `bad_size` pre-commit hook has been added to it.
 struct ViewportHookInstalled;
 
+/// Set on a surface once `ensure_viewport_valid` has run for it.
+struct ViewportChecked;
+
 fn viewport_pre_commit_hook<D: 'static>(
     _state: &mut D,
     _dh: &DisplayHandle,
     surface: &wl_surface::WlSurface,
 ) {
     with_states(surface, |states| {
-        states
-            .data_map
-            .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
+        // Once a buffer has been applied, `ensure_viewport_valid` checks `bad_size` with
+        // `out_of_buffer` at every commit, in that order. This hook covers the commits before.
+        if states.data_map.get::<ViewportChecked>().is_some() {
+            return;
+        }
         let viewport = states
             .data_map
-            .get::<ViewporterSurfaceState>()
-            .unwrap()
+            .get_or_insert_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None))
             .lock()
             .unwrap();
         if let Some(viewport) = &*viewport {
             let mut guard = states.cached_state.get::<ViewportCachedState>();
-            let viewport_state = guard.pending();
-
-            // If src_width or src_height are not integers and destination size is not set,
-            // the bad_size protocol error is raised when the surface state is applied.
-            let src_size = viewport_state.src.map(|src| src.size);
-            if viewport_state.dst.is_none()
-                && src_size != src_size.map(|s| Size::from((s.w as i32, s.h as i32)).to_f64())
-            {
-                if let Ok(viewport) = viewport.0.upgrade() {
-                    viewport.post_error(
-                        wp_viewport::Error::BadSize,
-                        "destination size is not integer".to_string(),
-                    );
-                }
+            if violates_bad_size(guard.pending()) {
+                post_bad_size(viewport);
             }
         }
     });
+}
+
+/// "If src_width or src_height are not integers and destination size is not set, the bad_size
+/// protocol error is raised when the surface state is applied."
+fn violates_bad_size(viewport_state: &ViewportCachedState) -> bool {
+    let src_size = viewport_state.src.map(|src| src.size);
+    viewport_state.dst.is_none()
+        && src_size != src_size.map(|s| Size::from((s.w as i32, s.h as i32)).to_f64())
+}
+
+fn post_bad_size(viewport: &ViewportMarker) {
+    if let Ok(viewport) = viewport.0.upgrade() {
+        viewport.post_error(
+            wp_viewport::Error::BadSize,
+            "destination size is not integer".to_string(),
+        );
+    }
 }
 
 /// Ensures that the viewport, if any, is valid accordingly to the protocol specification.
@@ -355,6 +364,8 @@ pub fn ensure_viewport_valid(states: &SurfaceData, buffer_size: Size<i32, Logica
         .unwrap()
         .lock()
         .unwrap();
+
+    states.data_map.insert_if_missing_threadsafe(|| ViewportChecked);
 
     if let Some(viewport) = &*viewport {
         let mut guard = states.cached_state.get::<ViewportCachedState>();
@@ -373,6 +384,10 @@ pub fn ensure_viewport_valid(states: &SurfaceData, buffer_size: Size<i32, Logica
                         buffer_rect.loc.x, buffer_rect.loc.y, buffer_rect.size.w, buffer_rect.size.h),
                 );
             }
+        }
+        if valid && violates_bad_size(state) {
+            post_bad_size(viewport);
+            return false;
         }
         valid
     } else {
