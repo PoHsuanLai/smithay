@@ -120,7 +120,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &wp_viewporter::WpViewporter,
+        resource: &wp_viewporter::WpViewporter,
         request: <wp_viewporter::WpViewporter as wayland_server::Resource>::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
@@ -136,7 +136,9 @@ where
                 });
 
                 if already_has_viewport {
-                    surface.post_error(
+                    // The error belongs to wp_viewporter's enum, so the manager is the object it is
+                    // raised on.
+                    resource.post_error(
                         wp_viewporter::Error::ViewportExists,
                         "the surface already has a viewport object associated".to_string(),
                     );
