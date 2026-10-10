@@ -415,8 +415,13 @@ impl PrivateSurfaceData {
 
     /// Reorders a surface relative to one of its sibling
     ///
-    /// Fails if `relative_to` is not a sibling or parent of `surface`.
+    /// Fails if `relative_to` is not a sibling or parent of `surface` (it is never `surface`).
     pub fn reorder(surface: &WlSurface, to: Location, relative_to: &WlSurface) -> Result<(), ()> {
+        // The reference must be a sibling or the parent; the sub-surface itself is neither
+        // (and would index past the list once removed).
+        if relative_to.id() == surface.id() {
+            return Err(());
+        }
         let parent = Self::get_parent(surface).ok_or(())?;
 
         fn index_of(surface: &WlSurface, slice: &[WlSurface]) -> Option<usize> {
