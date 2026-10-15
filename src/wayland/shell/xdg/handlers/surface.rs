@@ -30,8 +30,8 @@ use super::{
 };
 
 mod toplevel;
-use toplevel::make_toplevel_handle;
 pub use toplevel::{get_parent, send_toplevel_configure};
+use toplevel::{make_toplevel_handle, send_creation_capabilities};
 
 mod popup;
 pub use popup::{make_popup_handle, send_popup_configure};
@@ -148,6 +148,8 @@ where
                         alive_tracker: Default::default(),
                     },
                 );
+
+                send_creation_capabilities(&toplevel, surface);
 
                 state
                     .xdg_shell_state()

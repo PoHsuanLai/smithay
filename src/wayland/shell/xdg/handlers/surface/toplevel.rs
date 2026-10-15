@@ -6,7 +6,7 @@ use crate::{
         Dispatch2, compositor,
         shell::{
             is_valid_parent,
-            xdg::{ToplevelCachedState, XdgToplevelSurfaceData},
+            xdg::{ToplevelCachedState, WmCapabilitySet, XdgToplevelSurfaceData},
         },
     },
 };
@@ -299,19 +299,7 @@ pub fn send_toplevel_configure(
 
     // send the capabilities if requested
     if send_capabilities && resource.version() >= xdg_toplevel::EVT_WM_CAPABILITIES_SINCE {
-        let mut capabilities = configure
-            .state
-            .capabilities
-            .capabilities()
-            .copied()
-            .collect::<Vec<_>>();
-        let capabilities = {
-            let ptr = capabilities.as_mut_ptr();
-            let len = capabilities.len();
-            let cap = capabilities.capacity();
-            ::std::mem::forget(capabilities);
-            unsafe { Vec::from_raw_parts(ptr as *mut u8, len * 4, cap * 4) }
-        };
+        let capabilities = capabilities_bytes(&configure.state.capabilities);
         resource.wm_capabilities(capabilities);
     }
 
@@ -321,4 +309,40 @@ pub fn send_toplevel_configure(
     // Send the base xdg_surface configure event to mark
     // The configure as finished
     data.xdg_surface.configure(serial.into());
+}
+
+/// The wire form of a capability set: an array of u32.
+fn capabilities_bytes(capabilities: &WmCapabilitySet) -> Vec<u8> {
+    capabilities
+        .capabilities()
+        .flat_map(|capability| u32::from(*capability).to_ne_bytes())
+        .collect()
+}
+
+/// Send `xdg_toplevel.wm_capabilities` right after the toplevel is created.
+///
+/// This is only the capabilities event, never a configure: a configure at creation
+/// would put the toplevel's first `xdg_surface.configure` ahead of the keyboard enter
+/// that text-input clients expect first. The event is part of the toplevel's initial
+/// state, so the protocol allows it before the first configure. What was sent is
+/// remembered, so the first configure sends the capabilities again only if the handler
+/// changed them in between.
+pub(super) fn send_creation_capabilities(resource: &XdgToplevel, wl_surface: &wl_surface::WlSurface) {
+    if resource.version() < xdg_toplevel::EVT_WM_CAPABILITIES_SINCE {
+        return;
+    }
+    compositor::with_states(wl_surface, |states| {
+        let mut attributes = states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        let capabilities = match &attributes.server_pending {
+            Some(pending) => pending.capabilities.clone(),
+            None => attributes.current_server_state().capabilities,
+        };
+        resource.wm_capabilities(capabilities_bytes(&capabilities));
+        attributes.capabilities_sent = Some(capabilities);
+    });
 }

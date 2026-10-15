@@ -378,7 +378,10 @@ xdg_role!(
         pub app_id: Option<String>,
         /// An `zxdg_toplevel_decoration_v1::configure` event has been sent
         /// to the client.
-        pub initial_decoration_configure_sent: bool
+        pub initial_decoration_configure_sent: bool,
+        /// The capabilities already sent in `xdg_toplevel.wm_capabilities` at creation,
+        /// before any configure. The first configure repeats them only if they changed.
+        pub capabilities_sent: Option<WmCapabilitySet>
     },
     /// Represents the xdg_toplevel pending state
     #[derive(Debug, Default, Clone)]
@@ -1517,8 +1520,11 @@ impl ToplevelSurface {
 
                 // test if we should send a capabilities event, either because the
                 // capabilities changed or we never sent one
-                let capabilities_changed =
-                    !attributes.initial_configure_sent || (pending.capabilities != current.capabilities);
+                let capabilities_changed = if attributes.initial_configure_sent {
+                    pending.capabilities != current.capabilities
+                } else {
+                    attributes.capabilities_sent.as_ref() != Some(&pending.capabilities)
+                };
 
                 let configure = ToplevelConfigure {
                     serial: SERIAL_COUNTER.next_serial(),
