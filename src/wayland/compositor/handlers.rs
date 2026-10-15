@@ -26,6 +26,7 @@ use super::{
     AlreadyHasRole, BufferAssignment, CompositorHandler, Damage, Rectangle, RectangleKind, RegionAttributes,
     SurfaceAttributes,
     cache::Cacheable,
+    placement::SubsurfacePlacements,
     tree::{Location, PrivateSurfaceData},
 };
 
@@ -505,6 +506,12 @@ impl SubsurfaceUserData {
     }
 }
 /// The cached state associated with a subsurface
+///
+/// The location is not double-buffered by the subsurface itself: `wl_subsurface.set_position`
+/// "takes effect whenever the state of the parent surface is applied", so the request is kept
+/// in the PARENT's cached state and writes the `current()` location here when that state is
+/// applied (see `placement.rs`). The `pending()` location is never read: committing the
+/// subsurface neither carries nor applies a position.
 #[derive(Debug)]
 pub struct SubsurfaceCachedState {
     /// Location of the top-left corner of this subsurface
@@ -522,13 +529,11 @@ impl Default for SubsurfaceCachedState {
 
 impl Cacheable for SubsurfaceCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
-        Self {
-            location: self.location,
-        }
+        Self::default()
     }
 
-    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
-        into.location = self.location;
+    fn merge_into(self, _into: &mut Self, _dh: &DisplayHandle) {
+        // The parent's commit moves the subsurface, not its own.
     }
 }
 
@@ -580,16 +585,20 @@ where
         match request {
             wl_subsurface::Request::SetPosition { x, y } => {
                 let client_scale = state.client_compositor_state(client).client_scale();
-                PrivateSurfaceData::with_states(&self.surface, |state| {
-                    state
-                        .cached_state
-                        .get::<SubsurfaceCachedState>()
-                        .pending()
-                        .location = Point::<i32, Client>::from((x, y))
-                        .to_f64()
-                        .to_logical(client_scale)
-                        .to_i32_round();
-                })
+                let location = Point::<i32, Client>::from((x, y))
+                    .to_f64()
+                    .to_logical(client_scale)
+                    .to_i32_round();
+                // Applied with the parent's next commit, not the subsurface's.
+                if let Some(parent) = PrivateSurfaceData::get_parent(&self.surface) {
+                    PrivateSurfaceData::with_states(&parent, |states| {
+                        states
+                            .cached_state
+                            .get::<SubsurfacePlacements>()
+                            .pending()
+                            .set(self.surface.downgrade(), location);
+                    });
+                }
             }
             wl_subsurface::Request::PlaceAbove { sibling } => {
                 if let Err(()) = PrivateSurfaceData::reorder(&self.surface, Location::After, &sibling) {

@@ -107,6 +107,7 @@
 
 mod cache;
 mod handlers;
+mod placement;
 mod transaction;
 mod tree;
 
