@@ -3,15 +3,22 @@ use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use indexmap::IndexSet;
 
 use crate::{
+    backend::renderer::utils::RendererSurfaceStateUserData,
     utils::{IsAlive, Serial, alive_tracker::AliveTracker},
-    wayland::{Dispatch2, GlobalData, GlobalDispatch2},
+    wayland::{
+        Dispatch2, GlobalData, GlobalDispatch2,
+        compositor::{self, BufferAssignment, SurfaceAttributes},
+    },
 };
 
 use wayland_protocols::xdg::shell::server::{
     xdg_positioner::XdgPositioner, xdg_surface, xdg_surface::XdgSurface, xdg_wm_base, xdg_wm_base::XdgWmBase,
 };
 
-use wayland_server::{DataInit, Dispatch, DisplayHandle, New, Resource, Weak, backend::ClientId};
+use wayland_server::{
+    DataInit, Dispatch, DisplayHandle, New, Resource, Weak, backend::ClientId,
+    protocol::wl_surface::WlSurface,
+};
 
 use super::{ShellClient, ShellClientData, XdgPositionerUserData, XdgShellHandler, XdgSurfaceUserData};
 
@@ -58,6 +65,8 @@ where
                 data_init.init(id, XdgPositionerUserData::default());
             }
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                let has_role = compositor::get_role(&surface).is_some();
+                let has_buffer = has_buffer(&surface);
                 // Do not assign a role to the surface here
                 // xdg_surface is not role, only xdg_toplevel and
                 // xdg_popup are defined as roles
@@ -70,6 +79,17 @@ where
                         has_active_role: AtomicBool::new(false),
                     },
                 );
+                if has_role {
+                    wm_base.post_error(xdg_wm_base::Error::Role, "Surface already has a role.");
+                    return;
+                }
+                if has_buffer {
+                    wm_base.post_error(
+                        xdg_wm_base::Error::InvalidSurfaceState,
+                        "Surface already has a buffer attached or committed.",
+                    );
+                    return;
+                }
                 self.known_surfaces
                     .lock()
                     .unwrap()
@@ -106,6 +126,21 @@ where
         XdgShellHandler::client_destroyed(state, ShellClient::new(wm_base));
         self.alive_tracker.destroy_notify();
     }
+}
+
+/// Whether a buffer is attached (pending), committed and not yet taken by
+/// the renderer, or already held by the renderer's surface state.
+fn has_buffer(surface: &WlSurface) -> bool {
+    compositor::with_states(surface, |states| {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        let attached = |a: &SurfaceAttributes| matches!(a.buffer, Some(BufferAssignment::NewBuffer(_)));
+        let in_attributes = attached(attrs.pending()) || attached(attrs.current());
+        in_attributes
+            || states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .is_some_and(|state| state.lock().unwrap().buffer().is_some())
+    })
 }
 
 impl IsAlive for XdgWmBase {
