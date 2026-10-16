@@ -65,6 +65,7 @@ pub mod fifo;
 pub mod fixes;
 pub mod foreign_toplevel_list;
 pub mod fractional_scale;
+pub mod gate;
 pub mod idle_inhibit;
 pub mod idle_notify;
 pub mod image_capture_source;
@@ -98,6 +99,8 @@ pub mod xdg_toplevel_tag;
 pub mod xwayland_keyboard_grab;
 #[cfg(feature = "xwayland")]
 pub mod xwayland_shell;
+
+pub use gate::Gate;
 
 /// Empty user-data
 #[derive(Debug)]

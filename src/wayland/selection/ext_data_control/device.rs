@@ -9,19 +9,60 @@ use wayland_server::{Client, DisplayHandle};
 
 use crate::input::Seat;
 use crate::wayland::Dispatch2;
+use crate::wayland::gate::{Standing, StandingCell};
 use crate::wayland::selection::device::SelectionDevice;
 use crate::wayland::selection::offer::OfferReplySource;
 use crate::wayland::selection::seat_data::SeatData;
 use crate::wayland::selection::source::SelectionSourceProvider;
 use crate::wayland::selection::{SelectionSource, SelectionTarget};
 
-use super::DataControlHandler;
+use super::{DataControlHandler, ExtDataControlSourceUserData};
 
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ExtDataControlDeviceUserData {
     pub(crate) primary: bool,
     pub(crate) wl_seat: WlSeat,
+    /// Whether the device works; a held or refused device ignores its requests.
+    pub(crate) standing: StandingCell,
+}
+
+/// Register `device` for `seat`, and send it the current selection(s).
+pub(super) fn register_device<D>(
+    dh: &DisplayHandle,
+    seat: &Seat<D>,
+    device: ExtDataControlDeviceV1,
+    primary: bool,
+) where
+    D: DataControlHandler,
+    D: 'static,
+{
+    seat.user_data()
+        .insert_if_missing(|| RefCell::new(SeatData::<D::SelectionUserData>::new()));
+
+    let device = SelectionDevice::ExtDataControl(device);
+
+    let mut seat_data = seat
+        .user_data()
+        .get::<RefCell<SeatData<D::SelectionUserData>>>()
+        .unwrap()
+        .borrow_mut();
+
+    seat_data.add_device(device.clone());
+
+    // NOTE: broadcast selection only to the newly created device.
+    let device = Some(&device);
+    seat_data.send_selection::<D>(dh, SelectionTarget::Clipboard, device, true);
+    if primary {
+        seat_data.send_selection::<D>(dh, SelectionTarget::Primary, device, true);
+    }
+}
+
+/// Whether `source` may be set as a selection: a held or refused source may not.
+fn source_is_live(source: &ExtDataControlSourceV1) -> bool {
+    source
+        .data::<ExtDataControlSourceUserData>()
+        .is_none_or(|data| data.standing.get() == Standing::Live)
 }
 
 impl<D> Dispatch2<ExtDataControlDeviceV1, D> for ExtDataControlDeviceUserData
@@ -38,6 +79,10 @@ where
         dh: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, D>,
     ) {
+        if self.standing.get() != Standing::Live {
+            return;
+        }
+
         let seat = match Seat::<D>::from_resource(&self.wl_seat) {
             Some(seat) => seat,
             None => return,
@@ -45,6 +90,10 @@ where
 
         match request {
             ext_data_control_device_v1::Request::SetSelection { source, .. } => {
+                if source.as_ref().is_some_and(|source| !source_is_live(source)) {
+                    return;
+                }
+
                 // Each source can only be used once.
                 if let Some(source) = source.as_ref() {
                     if handler
@@ -81,6 +130,10 @@ where
             ext_data_control_device_v1::Request::SetPrimarySelection { source, .. } => {
                 // When the primary selection is disabled, we should simply ignore the requests.
                 if !self.primary {
+                    return;
+                }
+
+                if source.as_ref().is_some_and(|source| !source_is_live(source)) {
                     return;
                 }
 

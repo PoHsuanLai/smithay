@@ -9,6 +9,7 @@ use wayland_server::backend::ClientId;
 
 use crate::input::Seat;
 use crate::wayland::Dispatch2;
+use crate::wayland::gate::{Standing, StandingCell};
 use crate::wayland::selection::SelectionTarget;
 use crate::wayland::selection::offer::OfferReplySource;
 use crate::wayland::selection::seat_data::SeatData;
@@ -21,13 +22,16 @@ use super::DataControlHandler;
 pub struct DataControlSourceUserData {
     pub(crate) inner: Mutex<SourceMetadata>,
     display_handle: DisplayHandle,
+    /// Whether the source works; a refused source ignores its requests.
+    pub(crate) standing: StandingCell,
 }
 
 impl DataControlSourceUserData {
-    pub(crate) fn new(display_handle: DisplayHandle) -> Self {
+    pub(crate) fn new(display_handle: DisplayHandle, standing: Standing) -> Self {
         Self {
             inner: Default::default(),
             display_handle,
+            standing: StandingCell::new(standing),
         }
     }
 }
@@ -55,8 +59,12 @@ where
     ) {
         match request {
             zwlr_data_control_source_v1::Request::Offer { mime_type } => {
-                let mut data = self.inner.lock().unwrap();
-                data.mime_types.push(mime_type);
+                // A held source still notes what it offers, so that it is complete when it is
+                // released; a refused one ignores the request.
+                if self.standing.get() != Standing::Refused {
+                    let mut data = self.inner.lock().unwrap();
+                    data.mime_types.push(mime_type);
+                }
             }
             zwlr_data_control_source_v1::Request::Destroy => (),
             _ => unreachable!(),

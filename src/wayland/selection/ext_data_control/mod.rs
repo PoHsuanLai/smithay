@@ -60,11 +60,12 @@ use std::collections::HashMap;
 
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1;
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1;
-use wayland_server::backend::GlobalId;
+use wayland_server::backend::{ClientId, GlobalId};
 use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 mod device;
+mod held;
 mod source;
 
 pub use device::ExtDataControlDeviceUserData;
@@ -72,11 +73,23 @@ pub use source::ExtDataControlSourceUserData;
 
 use super::SelectionHandler;
 use super::primary_selection::PrimarySelectionState;
+use crate::wayland::gate::{Gate, HeldByClient};
+use held::Held;
 
 /// Access the data control state.
 pub trait DataControlHandler: Sized + SelectionHandler {
     /// [`DataControlState`] getter.
     fn data_control_state(&mut self) -> &mut DataControlState;
+
+    /// Whether `client` may use data control (watch and set the clipboard).
+    ///
+    /// Asked when the client creates a data device or a data source. The default is
+    /// [`Gate::Open`]. See [`Gate`] for what [`Gate::Hold`] and [`Gate::Refuse`] do here; held
+    /// objects are settled with [`DataControlState::release`].
+    fn data_control_gate(&mut self, client: &Client) -> Gate {
+        let _ = client;
+        Gate::Open
+    }
 }
 
 /// State of the data control.
@@ -88,6 +101,8 @@ pub struct DataControlState {
     /// Protocol states that each source can only be used once. We
     /// also use it during destruction to get seat data.
     pub(crate) used_sources: HashMap<ExtDataControlSourceV1, WlSeat>,
+    /// Devices and sources that clients created while on hold, by client.
+    held: HeldByClient<ClientId, Held>,
 }
 
 impl DataControlState {
@@ -111,6 +126,7 @@ impl DataControlState {
         Self {
             manager_global,
             used_sources: Default::default(),
+            held: Default::default(),
         }
     }
 
@@ -138,8 +154,6 @@ pub struct ExtDataControlManagerUserData {
 }
 
 mod handlers {
-    use std::cell::RefCell;
-
     use tracing::error;
     use wayland_protocols::ext::data_control::v1::server::{
         ext_data_control_device_v1::ExtDataControlDeviceV1,
@@ -149,10 +163,11 @@ mod handlers {
     use wayland_server::{Client, Dispatch, DisplayHandle};
 
     use crate::input::Seat;
-    use crate::wayland::selection::SelectionTarget;
-    use crate::wayland::selection::device::SelectionDevice;
-    use crate::wayland::selection::seat_data::SeatData;
+    use crate::wayland::gate::{Gate, Standing, StandingCell};
     use crate::wayland::{Dispatch2, GlobalDispatch2};
+
+    use super::device::register_device;
+    use super::held::Held;
 
     use super::DataControlHandler;
     use super::ExtDataControlDeviceUserData;
@@ -196,7 +211,7 @@ mod handlers {
     {
         fn request(
             &self,
-            _handler: &mut D,
+            handler: &mut D,
             client: &wayland_server::Client,
             _resource: &ExtDataControlManagerV1,
             request: <ExtDataControlManagerV1 as wayland_server::Resource>::Request,
@@ -205,44 +220,73 @@ mod handlers {
         ) {
             match request {
                 ext_data_control_manager_v1::Request::CreateDataSource { id } => {
-                    data_init.init(id, ExtDataControlSourceUserData::new(dh.clone()));
-                }
-                ext_data_control_manager_v1::Request::GetDataDevice { id, seat: wl_seat } => {
-                    match Seat::<D>::from_resource(&wl_seat) {
-                        Some(seat) => {
-                            seat.user_data()
-                                .insert_if_missing(|| RefCell::new(SeatData::<D::SelectionUserData>::new()));
-
-                            let device = SelectionDevice::ExtDataControl(data_init.init(
-                                id,
-                                ExtDataControlDeviceUserData {
-                                    wl_seat,
-                                    primary: self.primary,
-                                },
-                            ));
-
-                            let mut seat_data = seat
-                                .user_data()
-                                .get::<RefCell<SeatData<D::SelectionUserData>>>()
-                                .unwrap()
-                                .borrow_mut();
-
-                            seat_data.add_device(device.clone());
-
-                            // NOTE: broadcast selection only to the newly created device.
-                            let device = Some(&device);
-                            seat_data.send_selection::<D>(dh, SelectionTarget::Clipboard, device, true);
-                            if self.primary {
-                                seat_data.send_selection::<D>(dh, SelectionTarget::Primary, device, true);
+                    let gate = handler.data_control_gate(client);
+                    let source =
+                        data_init.init(id, ExtDataControlSourceUserData::new(dh.clone(), gate.into()));
+                    match gate {
+                        Gate::Open => (),
+                        Gate::Refuse => Held::Source(source).refuse(),
+                        Gate::Hold => {
+                            if let Err(held) = handler
+                                .data_control_state()
+                                .hold(client.id(), Held::Source(source))
+                            {
+                                held.refuse();
                             }
                         }
-                        None => {
-                            error!(
-                                data_control_device = ?id,
-                                client = ?client,
-                                "Unmanaged seat given to a primary selection device."
-                            );
+                    }
+                }
+                ext_data_control_manager_v1::Request::GetDataDevice { id, seat: wl_seat } => {
+                    let gate = handler.data_control_gate(client);
+                    if gate == Gate::Open {
+                        match Seat::<D>::from_resource(&wl_seat) {
+                            Some(seat) => {
+                                let device = data_init.init(
+                                    id,
+                                    ExtDataControlDeviceUserData {
+                                        wl_seat,
+                                        primary: self.primary,
+                                        standing: StandingCell::new(Standing::Live),
+                                    },
+                                );
+                                register_device::<D>(dh, &seat, device, self.primary);
+                            }
+                            None => {
+                                error!(
+                                    data_control_device = ?id,
+                                    client = ?client,
+                                    "Unmanaged seat given to a primary selection device."
+                                );
+                            }
                         }
+                        return;
+                    }
+
+                    let device = data_init.init(
+                        id,
+                        ExtDataControlDeviceUserData {
+                            wl_seat: wl_seat.clone(),
+                            primary: self.primary,
+                            standing: StandingCell::new(gate.into()),
+                        },
+                    );
+                    let primary = self.primary;
+                    let open_device = device.clone();
+                    let held = Held::Device {
+                        device,
+                        open: Box::new(move |dh: &DisplayHandle| {
+                            if let Some(seat) = Seat::<D>::from_resource(&wl_seat) {
+                                register_device::<D>(dh, &seat, open_device, primary);
+                            }
+                        }),
+                    };
+                    match gate {
+                        Gate::Hold => {
+                            if let Err(held) = handler.data_control_state().hold(client.id(), held) {
+                                held.refuse();
+                            }
+                        }
+                        _ => held.refuse(),
                     }
                 }
                 ext_data_control_manager_v1::Request::Destroy => (),
