@@ -125,6 +125,41 @@ impl<K: Hash + Eq, T> HeldByClient<K, T> {
     }
 }
 
+/// Objects that were opened, so that the compositor can end them later.
+///
+/// Smithay keeps its own registry of them (a seat's devices, say) and hands out no handle to it;
+/// this list is what lets a revocation find the ones that belong to one client.
+#[derive(Debug)]
+pub(crate) struct LiveObjects<T> {
+    items: Vec<T>,
+}
+
+impl<T> Default for LiveObjects<T> {
+    fn default() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+impl<T> LiveObjects<T> {
+    /// Remember `item`. Items for which `alive` is false are dropped first, so the list does not
+    /// outgrow the objects that exist.
+    pub(crate) fn track(&mut self, item: T, alive: impl Fn(&T) -> bool) {
+        self.items.retain(&alive);
+        self.items.push(item);
+    }
+
+    /// Forget and return every item for which `ours` is true. Items for which `alive` is false are
+    /// dropped without being returned.
+    pub(crate) fn end(&mut self, alive: impl Fn(&T) -> bool, ours: impl Fn(&T) -> bool) -> Vec<T> {
+        let (ended, kept) = std::mem::take(&mut self.items)
+            .into_iter()
+            .filter(|item| alive(item))
+            .partition(|item| ours(item));
+        self.items = kept;
+        ended
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +221,30 @@ mod tests {
         // Items below 8 are gone: the next hold prunes them first.
         assert_eq!(held.hold(1, 50, |n| *n >= 8 || *n == 50), Ok(()));
         assert_eq!(held.take(&1).len(), MAX_HELD_PER_CLIENT - 8 + 1);
+    }
+
+    #[test]
+    fn end_returns_the_clients_items_and_keeps_the_rest() {
+        let mut live = LiveObjects::<(u8, u32)>::default();
+        for item in [(1, 10), (2, 20), (1, 11)] {
+            live.track(item, |_| true);
+        }
+        assert_eq!(live.end(|_| true, |item| item.0 == 1), vec![(1, 10), (1, 11)]);
+        // Ending a client twice finds nothing; the other client is still there.
+        assert!(live.end(|_| true, |item| item.0 == 1).is_empty());
+        assert_eq!(live.end(|_| true, |item| item.0 == 2), vec![(2, 20)]);
+    }
+
+    #[test]
+    fn dead_items_are_pruned_when_tracking_and_ending() {
+        let mut live = LiveObjects::<(u8, u32)>::default();
+        live.track((1, 10), |_| true);
+        live.track((1, 11), |_| true);
+        // A new item prunes the dead ones before it is added.
+        live.track((1, 12), |item| item.1 != 10);
+        // A dead item is dropped, not returned, when its client is ended.
+        assert_eq!(live.end(|item| item.1 != 11, |item| item.0 == 1), vec![(1, 12)]);
+        assert!(live.end(|_| true, |_| true).is_empty());
     }
 
     #[test]

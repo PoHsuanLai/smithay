@@ -28,6 +28,24 @@ pub struct ExtDataControlDeviceUserData {
     pub(crate) standing: StandingCell,
 }
 
+impl ExtDataControlDeviceUserData {
+    /// Stop `device` taking part: it ignores its requests from now on and its seat forgets it.
+    pub(super) fn end<D>(&self, device: &ExtDataControlDeviceV1)
+    where
+        D: DataControlHandler + 'static,
+    {
+        self.standing.set(Standing::Refused);
+        if let Some(seat) = Seat::<D>::from_resource(&self.wl_seat) {
+            if let Some(seat_data) = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>() {
+                seat_data.borrow_mut().retain_devices(|known| match known {
+                    SelectionDevice::ExtDataControl(known) => known != device,
+                    _ => true,
+                });
+            }
+        }
+    }
+}
+
 /// Register `device` for `seat`, and send it the current selection(s).
 pub(super) fn register_device<D>(
     dh: &DisplayHandle,

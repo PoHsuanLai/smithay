@@ -37,7 +37,7 @@ impl fmt::Debug for Held {
 
 impl Held {
     /// Whether the object still exists.
-    fn is_alive(&self) -> bool {
+    pub(super) fn is_alive(&self) -> bool {
         match self {
             Held::Device { device, .. } => device.is_alive(),
             Held::Source(source) => source.is_alive(),
@@ -45,13 +45,19 @@ impl Held {
     }
 
     /// Let the object work as if it had been created open.
-    fn open(self, dh: &DisplayHandle) {
+    ///
+    /// Gives back the device, if the object is one, as it is now registered with its seat.
+    fn open(self, dh: &DisplayHandle) -> Option<ZwlrDataControlDeviceV1> {
         match self {
             Held::Device { device, open } => {
                 device_data(&device).standing.set(Standing::Live);
                 open(dh);
+                Some(device)
             }
-            Held::Source(source) => source_data(&source).standing.set(Standing::Live),
+            Held::Source(source) => {
+                source_data(&source).standing.set(Standing::Live);
+                None
+            }
         }
     }
 
@@ -96,7 +102,11 @@ impl DataControlState {
         }
         for held in self.held.take(client).into_iter().filter(Held::is_alive) {
             match gate {
-                Gate::Open => held.open(dh),
+                Gate::Open => {
+                    if let Some(device) = held.open(dh) {
+                        self.track(device);
+                    }
+                }
                 Gate::Refuse => held.refuse(),
                 Gate::Hold => {}
             }

@@ -59,6 +59,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_device_v1::ZwlrDataControlDeviceV1;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1;
 use wayland_server::backend::{ClientId, GlobalId};
@@ -67,6 +68,7 @@ use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 mod device;
 mod held;
+mod live;
 mod source;
 
 pub use device::DataControlDeviceUserData;
@@ -74,7 +76,7 @@ pub use source::DataControlSourceUserData;
 
 use super::SelectionHandler;
 use super::primary_selection::PrimarySelectionState;
-use crate::wayland::gate::{Gate, HeldByClient};
+use crate::wayland::gate::{Gate, HeldByClient, LiveObjects};
 use held::Held;
 
 /// Access the data control state.
@@ -104,6 +106,8 @@ pub struct DataControlState {
     pub(crate) used_sources: HashMap<ZwlrDataControlSourceV1, WlSeat>,
     /// Devices and sources that clients created while on hold, by client.
     held: HeldByClient<ClientId, Held>,
+    /// Devices that are registered with a seat, so that a revocation can end them.
+    live: LiveObjects<ZwlrDataControlDeviceV1>,
 }
 
 impl DataControlState {
@@ -130,6 +134,7 @@ impl DataControlState {
             manager_global,
             used_sources: Default::default(),
             held: Default::default(),
+            live: Default::default(),
         }
     }
 
@@ -256,6 +261,7 @@ mod handlers {
                                     },
                                 );
                                 let primary = (*self.primary_selection_filter)(client);
+                                handler.data_control_state().track(device.clone());
                                 register_device::<D>(dh, &seat, device, primary);
                             }
                             None => {
