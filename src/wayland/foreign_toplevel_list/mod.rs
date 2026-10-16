@@ -48,13 +48,26 @@ use wayland_server::{
 
 use crate::{
     utils::user_data::UserDataMap,
-    wayland::{Dispatch2, GlobalData, GlobalDispatch2},
+    wayland::{Dispatch2, Gate, GlobalData, GlobalDispatch2, gate::HeldByClient},
 };
+
+mod held;
+use held::HeldList;
 
 /// Handler for foreign toplevel list protocol
 pub trait ForeignToplevelListHandler: 'static {
     /// [ForeignToplevelListState] getter
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState;
+
+    /// Whether `client` may see the list of toplevels.
+    ///
+    /// Asked when the client binds the list, before any toplevel is sent. The default is
+    /// [`Gate::Open`]. See [`Gate`] for what [`Gate::Hold`] and [`Gate::Refuse`] do here (a refused
+    /// list is sent `finished`); held lists are settled with [`ForeignToplevelListState::release`].
+    fn foreign_toplevel_list_gate(&mut self, client: &Client) -> Gate {
+        let _ = client;
+        Gate::Open
+    }
 }
 
 #[derive(Debug)]
@@ -291,6 +304,8 @@ pub struct ForeignToplevelListState {
     toplevels: Vec<ForeignToplevelWeakHandle>,
     list_instances: Vec<ExtForeignToplevelListV1>,
     dh: DisplayHandle,
+    /// Lists that clients bound while on hold, by client.
+    held: HeldByClient<ClientId, HeldList>,
 }
 
 impl ForeignToplevelListState {
@@ -324,6 +339,7 @@ impl ForeignToplevelListState {
             toplevels: Vec::new(),
             list_instances: Vec::new(),
             dh: dh.clone(),
+            held: Default::default(),
         }
     }
 
@@ -443,6 +459,39 @@ impl std::fmt::Debug for ForeignToplevelListGlobalData {
     }
 }
 
+/// Send `instance` every current toplevel and keep it for the ones to come.
+fn announce<D>(
+    state: &mut ForeignToplevelListState,
+    dh: &DisplayHandle,
+    client: &Client,
+    instance: ExtForeignToplevelListV1,
+) where
+    D: ForeignToplevelListHandler + Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelHandle>,
+{
+    state.toplevels.retain(|handle| {
+        let Some(handle) = handle.upgrade() else {
+            // Cleanup dead handles
+            return false;
+        };
+
+        if handle.is_closed() {
+            // Cleanup closed handles
+            return false;
+        }
+
+        if let Ok(toplevel) =
+            client.create_resource::<ExtForeignToplevelHandleV1, _, D>(dh, instance.version(), handle.clone())
+        {
+            instance.toplevel(&toplevel);
+            handle.init_new_instance(toplevel);
+        }
+
+        true
+    });
+
+    state.list_instances.push(instance);
+}
+
 impl<D: ForeignToplevelListHandler> GlobalDispatch2<ExtForeignToplevelListV1, D>
     for ForeignToplevelListGlobalData
 where
@@ -459,32 +508,23 @@ where
     ) {
         let instance = data_init.init(resource, GlobalData);
 
-        let state = state.foreign_toplevel_list_state();
-
-        state.toplevels.retain(|handle| {
-            let Some(handle) = handle.upgrade() else {
-                // Cleanup dead handles
-                return false;
-            };
-
-            if handle.is_closed() {
-                // Cleanup closed handles
-                return false;
+        match state.foreign_toplevel_list_gate(client) {
+            Gate::Open => announce::<D>(state.foreign_toplevel_list_state(), dh, client, instance),
+            Gate::Refuse => instance.finished(),
+            Gate::Hold => {
+                let held = HeldList {
+                    instance: instance.clone(),
+                    open: Box::new(
+                        move |state: &mut ForeignToplevelListState, dh: &DisplayHandle, client: &Client| {
+                            announce::<D>(state, dh, client, instance)
+                        },
+                    ),
+                };
+                if let Err(held) = state.foreign_toplevel_list_state().hold(client.id(), held) {
+                    held.refuse();
+                }
             }
-
-            if let Ok(toplevel) = client.create_resource::<ExtForeignToplevelHandleV1, _, D>(
-                dh,
-                instance.version(),
-                handle.clone(),
-            ) {
-                instance.toplevel(&toplevel);
-                handle.init_new_instance(toplevel);
-            }
-
-            true
-        });
-
-        state.list_instances.push(instance);
+        }
     }
 
     fn can_view(&self, client: &Client) -> bool {
@@ -504,8 +544,15 @@ impl<D: ForeignToplevelListHandler> Dispatch2<ExtForeignToplevelListV1, D> for G
     ) {
         match request {
             ext_foreign_toplevel_list_v1::Request::Stop => {
-                self.destroyed(state, client.id(), manager);
-                manager.finished();
+                // A held or refused list was never announced to, and was told what it needs.
+                if state
+                    .foreign_toplevel_list_state()
+                    .list_instances
+                    .contains(manager)
+                {
+                    self.destroyed(state, client.id(), manager);
+                    manager.finished();
+                }
             }
             ext_foreign_toplevel_list_v1::Request::Destroy => {}
             _ => unreachable!(),
