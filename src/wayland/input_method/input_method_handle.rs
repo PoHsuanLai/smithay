@@ -17,7 +17,12 @@ use wayland_server::{backend::ClientId, protocol::wl_surface::WlSurface};
 use crate::{
     input::{SeatHandler, keyboard::KeyboardHandle},
     utils::{Logical, Rectangle, SERIAL_COUNTER, alive_tracker::AliveTracker},
-    wayland::{Dispatch2, compositor, seat::WaylandFocus, text_input::TextInputHandle},
+    wayland::{
+        Dispatch2, compositor,
+        gate::{Standing, StandingCell},
+        seat::WaylandFocus,
+        text_input::TextInputHandle,
+    },
 };
 
 use super::{
@@ -147,6 +152,17 @@ impl InputMethodHandle {
         });
     }
 
+    /// Activate a just-bound input method, which has no popup surface yet, without compositor
+    /// state: there is no popup to place.
+    pub(crate) fn activate_input_method_detached(&self) {
+        self.with_instance(|instance| instance.object.activate());
+    }
+
+    /// Remember the text input's cursor rectangle for a popup that is yet to come.
+    pub(crate) fn store_text_input_rectangle(&self, rect: Rectangle<i32, Logical>) {
+        self.inner.lock().unwrap().popup_handle.rectangle = rect;
+    }
+
     /// Deactivate the active input method.
     ///
     /// The `done` is always send when deactivating IME.
@@ -176,6 +192,8 @@ pub struct InputMethodUserData<D: SeatHandler> {
     pub(crate) new_popup: fn(&mut D, PopupSurface),
     pub(crate) popup_repositioned: fn(&mut D, PopupSurface),
     pub(crate) dismiss_popup: fn(&mut D, PopupSurface),
+    /// Whether the input method works; a held or refused one ignores its requests.
+    pub(crate) standing: Arc<StandingCell>,
 }
 
 impl<D: SeatHandler> fmt::Debug for InputMethodUserData<D> {
@@ -206,6 +224,32 @@ where
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        if self.standing.get() != Standing::Live {
+            // Ignore the request, but give the objects it creates an inert life.
+            match request {
+                zwp_input_method_v2::Request::GetInputPopupSurface { id, .. } => {
+                    data_init.init(
+                        id,
+                        InputMethodPopupSurfaceUserData {
+                            alive_tracker: AliveTracker::default(),
+                        },
+                    );
+                }
+                zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
+                    data_init.init(
+                        keyboard,
+                        InputMethodKeyboardUserData {
+                            handle: InputMethodKeyboardGrab::default(),
+                            keyboard_handle: self.keyboard_handle.clone(),
+                            standing: Standing::Refused,
+                        },
+                    );
+                }
+                _ => (),
+            }
+            return;
+        }
+
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
                 self.text_input_handle.with_active_text_input(|ti, _surface| {
@@ -288,6 +332,7 @@ where
                     InputMethodKeyboardUserData {
                         handle: input_method.keyboard_grab.clone(),
                         keyboard_handle: self.keyboard_handle.clone(),
+                        standing: Standing::Live,
                     },
                 );
                 let mut keyboard = input_method.keyboard_grab.inner.lock().unwrap();
@@ -323,6 +368,10 @@ where
     }
 
     fn destroyed(&self, _state: &mut D, _client: ClientId, _input_method: &ZwpInputMethodV2) {
+        if self.standing.get() != Standing::Live {
+            // Never the seat's input method, so there is nothing of the seat's to clear.
+            return;
+        }
         // The text input keeps its focus and stays enabled: text-input-unstable-v3 has no event
         // for "no input method", and `leave` would end the field's enabled state. A later input
         // method is activated for it (`TextInputHandle::activate_late_input_method`).

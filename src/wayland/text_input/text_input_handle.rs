@@ -160,6 +160,26 @@ impl TextInputHandle {
         input_method: &InputMethodHandle,
         state: &mut D,
     ) {
+        if let Some((focus, applied)) = self.enabled_field() {
+            input_method.activate_input_method(state, &focus);
+            relay_state(input_method, state, applied);
+        }
+    }
+
+    /// Like [`Self::activate_late_input_method`], for an input method that has just bound and has
+    /// no popup surface yet, which is how one is released from a gate without compositor state at
+    /// hand. The popup callbacks are not called: there is no popup to place.
+    pub(crate) fn activate_late_input_method_detached(&self, input_method: &InputMethodHandle) {
+        if let Some((_, applied)) = self.enabled_field() {
+            input_method.activate_input_method_detached();
+            relay_state_with(input_method, applied, |rect| {
+                input_method.store_text_input_rectangle(rect)
+            });
+        }
+    }
+
+    /// The surface of the enabled text input and what it has committed, if one is enabled.
+    fn enabled_field(&self) -> Option<(WlSurface, TextInputState)> {
         let mut focus = None;
         let mut applied = TextInputState::default();
         {
@@ -169,10 +189,7 @@ impl TextInputHandle {
                 applied = inner.applied.clone();
             }
         }
-        if let Some(focus) = focus {
-            input_method.activate_input_method(state, &focus);
-            relay_state(input_method, state, applied);
-        }
+        focus.map(|focus| (focus, applied))
     }
 
     /// The `discard_state` is used when the input-method signaled that
@@ -388,12 +405,22 @@ struct Instance {
 fn relay_state<D: SeatHandler + 'static>(
     input_method: &InputMethodHandle,
     state: &mut D,
+    new_state: TextInputState,
+) {
+    relay_state_with(input_method, new_state, |rect| {
+        input_method.set_text_input_rectangle::<D>(state, rect)
+    });
+}
+
+/// Send `new_state` to the input method, then `done`. The cursor rectangle goes to `set_rectangle`.
+fn relay_state_with(
+    input_method: &InputMethodHandle,
     mut new_state: TextInputState,
+    set_rectangle: impl FnOnce(Rectangle<i32, Logical>),
 ) {
     if let Some((text, cursor, anchor)) = new_state.surrounding_text.take() {
-        input_method.with_instance(move |input_method| {
-            input_method.object.surrounding_text(text, cursor, anchor)
-        });
+        input_method
+            .with_instance(move |input_method| input_method.object.surrounding_text(text, cursor, anchor));
     }
 
     if let Some(cause) = new_state.text_change_cause.take() {
@@ -409,7 +436,7 @@ fn relay_state<D: SeatHandler + 'static>(
     }
 
     if let Some(rect) = new_state.cursor_rectangle.take() {
-        input_method.set_text_input_rectangle::<D>(state, rect);
+        set_rectangle(rect);
     }
 
     input_method.with_instance(|input_method| {
