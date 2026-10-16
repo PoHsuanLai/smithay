@@ -28,7 +28,7 @@ impl fmt::Debug for HeldList {
 
 impl HeldList {
     /// Whether the list still exists.
-    fn is_alive(&self) -> bool {
+    pub(super) fn is_alive(&self) -> bool {
         self.instance.is_alive()
     }
 

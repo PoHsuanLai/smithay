@@ -52,6 +52,7 @@ use crate::{
 };
 
 mod held;
+mod revoke;
 use held::HeldList;
 
 /// Handler for foreign toplevel list protocol
