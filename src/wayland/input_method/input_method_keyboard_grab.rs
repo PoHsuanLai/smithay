@@ -101,12 +101,20 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
 }
 
 impl<D: SeatHandler + 'static> Dispatch2<ZwpInputMethodKeyboardGrabV2, D> for InputMethodKeyboardUserData<D> {
-    fn destroyed(&self, state: &mut D, _client: ClientId, _object: &ZwpInputMethodKeyboardGrabV2) {
+    fn destroyed(&self, state: &mut D, _client: ClientId, object: &ZwpInputMethodKeyboardGrabV2) {
         if self.standing != Standing::Live {
             // It never took the seat's keyboard, so it has none to give back.
             return;
         }
-        self.handle.inner.lock().unwrap().grab = None;
+        {
+            let mut keyboard = self.handle.inner.lock().unwrap();
+            if keyboard.grab.as_ref() != Some(object) {
+                // Not the seat's grab any more: a revoked input method's grab, which another
+                // input method may have replaced.
+                return;
+            }
+            keyboard.grab = None;
+        }
         self.keyboard_handle.unset_grab(state);
     }
 

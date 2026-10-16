@@ -90,6 +90,7 @@ mod held;
 mod input_method_handle;
 mod input_method_keyboard_grab;
 mod input_method_popup_surface;
+mod revoke;
 pub use input_method_popup_surface::{PopupParent, PopupSurface};
 
 use held::{HeldInputMethod, HeldInputMethods};
