@@ -7,7 +7,7 @@ use libseat::{Seat, SeatEvent};
 use std::{
     cell::RefCell,
     collections::HashMap,
-    os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     path::Path,
     rc::{Rc, Weak},
     sync::{
@@ -25,7 +25,7 @@ use calloop::{
 
 use crate::backend::session::{AsErrno, Event as SessionEvent, Session};
 
-use tracing::{debug, info_span, instrument};
+use tracing::{debug, error, info_span, instrument, warn};
 
 #[derive(Debug)]
 struct LibSeatSessionImpl {
@@ -65,49 +65,51 @@ impl LibSeatSession {
         let (tx, rx) = calloop::channel::channel();
 
         let seat = {
-            Seat::open(move |_seat, event| match event {
-                SeatEvent::Enable => {
-                    debug!("Enable callback called");
-                    tx.send(event).unwrap();
+            Seat::open(move |_seat, event| {
+                match event {
+                    SeatEvent::Enable => debug!("Enable callback called"),
+                    SeatEvent::Disable => debug!("Disable callback called"),
                 }
-                SeatEvent::Disable => {
-                    debug!("Disable callback called");
-                    tx.send(event).unwrap();
+                // The receiver lives as long as the notifier. If it is gone
+                // nobody is listening any more, so the event can be dropped.
+                if tx.send(event).is_err() {
+                    debug!("Seat event dropped, the session notifier is gone");
                 }
             })
         };
 
         drop(_guard);
-        seat.map(|mut seat| {
-            let seat_name = seat.name().to_owned();
+        let mut seat = seat.map_err(|err| Error::FailedToOpenSession(to_errno(err)))?;
+        let seat_name = seat.name().to_owned();
 
-            // In some cases enable_seat event is available right after startup
-            // so, we can dispatch it
-            seat.dispatch(0).unwrap();
-            let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
+        // In some cases enable_seat event is available right after startup
+        // so, we can dispatch it
+        if let Err(err) = seat.dispatch(0) {
+            error!("Initial libseat dispatch failed: {}", err);
+            return Err(Error::FailedToOpenSession(to_errno(err)));
+        }
+        let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
 
-            let internal = Rc::new(LibSeatSessionImpl {
-                seat: RefCell::new(seat),
-                active: Arc::new(AtomicBool::new(active)),
-                devices: RefCell::new(HashMap::new()),
-            });
+        let internal = Rc::new(LibSeatSessionImpl {
+            seat: RefCell::new(seat),
+            active: Arc::new(AtomicBool::new(active)),
+            devices: RefCell::new(HashMap::new()),
+        });
 
-            let session = LibSeatSession {
-                internal: Rc::downgrade(&internal),
-                seat_name,
-                span: span.clone(),
-            };
+        let session = LibSeatSession {
+            internal: Rc::downgrade(&internal),
+            seat_name,
+            span: span.clone(),
+        };
 
-            let notifier = LibSeatSessionNotifier {
-                internal,
-                rx,
-                token: None,
-                span,
-            };
+        let notifier = LibSeatSessionNotifier {
+            internal,
+            rx,
+            token: None,
+            span,
+        };
 
-            (session, notifier)
-        })
-        .map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))
+        Ok((session, notifier))
     }
 }
 
@@ -211,12 +213,22 @@ impl EventSource for LibSeatSessionNotifier {
     where
         F: FnMut(SessionEvent, &mut ()),
     {
-        if Some(token) == self.token {
-            self.internal.seat.borrow_mut().dispatch(0).unwrap();
-        }
+        // A failed dispatch means the seat is gone (seatd died, the session was
+        // revoked). Events already queued are still delivered below, then the
+        // session is paused and the source removed, so the loop never spins on
+        // a dead fd.
+        let dispatch_failed = Some(token) == self.token
+            && match self.internal.seat.borrow_mut().dispatch(0) {
+                Ok(_) => false,
+                Err(err) => {
+                    error!("libseat dispatch failed, removing the session source: {}", err);
+                    true
+                }
+            };
 
         let internal = &self.internal;
-        self.rx
+        let action = self
+            .rx
             .process_events(readiness, token, |event, _| match event {
                 channel::Event::Msg(event) => match event {
                     SeatEvent::Enable => {
@@ -225,7 +237,11 @@ impl EventSource for LibSeatSessionNotifier {
                     }
                     SeatEvent::Disable => {
                         internal.active.store(false, Ordering::SeqCst);
-                        internal.seat.borrow_mut().disable().unwrap();
+                        // The session is paused whether or not the seat
+                        // accepted the acknowledgement.
+                        if let Err(err) = internal.seat.borrow_mut().disable() {
+                            warn!("Failed to acknowledge the seat disable: {}", err);
+                        }
                         callback(SessionEvent::PauseSession, &mut ());
                     }
                 },
@@ -233,36 +249,36 @@ impl EventSource for LibSeatSessionNotifier {
                     // Tx is stored inside of Seat, and Rc<Seat> is stored in LibSeatSessionNotifier so this is unreachable
                 }
             })
-            .map_err(|_| Error::SessionLost)
+            .map_err(|_| Error::SessionLost)?;
+
+        if !dispatch_failed {
+            return Ok(action);
+        }
+        if internal.active.swap(false, Ordering::SeqCst) {
+            callback(SessionEvent::PauseSession, &mut ());
+        }
+        Ok(PostAction::Remove)
     }
 
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.rx.register(poll, factory)?;
 
-        self.token = Some(factory.token());
+        let token = factory.token();
+        self.token = Some(token);
         let mut seat = self.internal.seat.borrow_mut();
+        let fd = seat_fd(&mut seat)?;
         // Safety: the seat fd cannot be close without removing the LibSeatSessionNotifier from the event loop
-        unsafe {
-            poll.register(
-                seat.get_fd().unwrap(),
-                calloop::Interest::READ,
-                calloop::Mode::Level,
-                self.token.unwrap(),
-            )
-        }
+        unsafe { poll.register(fd, calloop::Interest::READ, calloop::Mode::Level, token) }
     }
 
     fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.rx.reregister(poll, factory)?;
 
-        self.token = Some(factory.token());
+        let token = factory.token();
+        self.token = Some(token);
         let mut seat = self.internal.seat.borrow_mut();
-        poll.reregister(
-            seat.get_fd().unwrap(),
-            calloop::Interest::READ,
-            calloop::Mode::Level,
-            self.token.unwrap(),
-        )
+        let fd = seat_fd(&mut seat)?;
+        poll.reregister(fd, calloop::Interest::READ, calloop::Mode::Level, token)
     }
 
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
@@ -270,8 +286,27 @@ impl EventSource for LibSeatSessionNotifier {
 
         self.token = None;
         let mut seat = self.internal.seat.borrow_mut();
-        poll.unregister(seat.get_fd().unwrap())
+        // If the seat has no fd any more there is nothing left to unregister,
+        // the kernel dropped it from the poll set when the fd was closed.
+        match seat_fd(&mut seat) {
+            Ok(fd) => poll.unregister(fd),
+            Err(err) => {
+                debug!("No libseat fd to unregister: {}", err);
+                Ok(())
+            }
+        }
     }
+}
+
+/// Converts a libseat error number into the errno type used by [`Error`].
+fn to_errno(err: impl Into<i32>) -> Errno {
+    Errno::from_raw_os_error(err.into())
+}
+
+/// The pollable fd of the seat, or the io error libseat reported for it.
+fn seat_fd(seat: &mut Seat) -> std::io::Result<BorrowedFd<'_>> {
+    seat.get_fd()
+        .map_err(|err| std::io::Error::from_raw_os_error(err.into()))
 }
 
 /// Errors related to direct/tty sessions
