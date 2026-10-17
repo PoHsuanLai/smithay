@@ -338,6 +338,10 @@ pub fn run_udev() {
                     }
                 }
             }
+            SessionEvent::SessionLost => {
+                error!("the session is gone; stopping");
+                data.running.store(false, Ordering::SeqCst);
+            }
             SessionEvent::ActivateSession => {
                 info!("resuming session");
 

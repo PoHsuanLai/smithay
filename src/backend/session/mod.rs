@@ -67,6 +67,10 @@ pub enum Event {
     PauseSession,
     /// The whole session has been activated
     ActivateSession,
+    /// The session is gone for good: the seat could not be read (seatd stopped, the session
+    /// was revoked). Its devices are already unusable and no `ActivateSession` follows; the
+    /// session's event source has been removed from the loop.
+    SessionLost,
 }
 
 impl Session for () {

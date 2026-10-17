@@ -215,8 +215,9 @@ impl EventSource for LibSeatSessionNotifier {
     {
         // A failed dispatch means the seat is gone (seatd died, the session was
         // revoked). Events already queued are still delivered below, then the
-        // session is paused and the source removed, so the loop never spins on
-        // a dead fd.
+        // session is reported lost and the source removed, so the loop never
+        // spins on a dead fd. Lost is not a pause: a pause expects the seat
+        // back, and a compositor waiting for it would wait forever.
         let dispatch_failed = Some(token) == self.token
             && match self.internal.seat.borrow_mut().dispatch(0) {
                 Ok(_) => false,
@@ -254,9 +255,8 @@ impl EventSource for LibSeatSessionNotifier {
         if !dispatch_failed {
             return Ok(action);
         }
-        if internal.active.swap(false, Ordering::SeqCst) {
-            callback(SessionEvent::PauseSession, &mut ());
-        }
+        internal.active.store(false, Ordering::SeqCst);
+        callback(SessionEvent::SessionLost, &mut ());
         Ok(PostAction::Remove)
     }
 
